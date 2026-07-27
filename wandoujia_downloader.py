@@ -301,7 +301,15 @@ def resolve_jobs(
             for index, url in enumerate(detail_urls)
         }
         for future in as_completed(futures):
-            indexed_jobs[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                indexed_jobs[index] = future.result()
+            except (ValueError, HTTPError, URLError, TimeoutError) as error:
+                detail_url = detail_urls[index]
+                print(
+                    f"[warn] skip detail {detail_url}: {error}",
+                    file=sys.stderr,
+                )
 
     return [indexed_jobs[index] for index in sorted(indexed_jobs)]
 
@@ -473,7 +481,14 @@ def download_jobs(jobs: list[ApkJob], options: Options) -> list[Path]:
             for index, job in enumerate(jobs, 1)
         }
         for future in as_completed(futures):
-            indexed_paths[futures[future]] = future.result()
+            index = futures[future]
+            try:
+                indexed_paths[index] = future.result()
+            except (HTTPError, URLError, TimeoutError, OSError) as error:
+                print(
+                    f"[warn] skip download #{index}: {error}",
+                    file=sys.stderr,
+                )
     return [indexed_paths[index] for index in sorted(indexed_paths)]
 
 
