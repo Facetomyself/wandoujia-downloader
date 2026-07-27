@@ -1,29 +1,18 @@
 #!/usr/bin/env python3
-"""Download APKs from Wandoujia history pages.
-
-Output file name format:
-    package-version-year.apk
-
-The package/version are verified by app-rename/apprename when available, with
-Wandoujia HTML metadata as fallback.
-"""
-
-from __future__ import annotations
+"""Download APKs from Wandoujia history pages."""
 
 import argparse
+import asyncio
 import html
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
-from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlparse
-from urllib.request import Request, urlopen
+
+import aiohttp
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -35,7 +24,7 @@ DETAIL_RE = re.compile(
     r"|/apps/\d+/history_v\d+"
 )
 APP_ID_RE = re.compile(r"/apps/(\d+)")
-HISTORY_DETAIL_RE = re.compile(r"/history_v\d+/?$")
+DETAIL_PATH_RE = re.compile(r"/history_v\d+/?$")
 HISTORY_YEAR_RE = re.compile(r"history_y(\d{4})")
 UPDATE_YEAR_RE = re.compile(r"更新时间\s*[:：]\s*(\d{4})年|history_y(\d{4})")
 DATA_HREF_RE = re.compile(r"data-href=[\"']([^\"']+\.apk[^\"']*)[\"']", re.I)
@@ -55,59 +44,74 @@ TITLE_RE = re.compile(
 )
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True, frozen=True)
 class ApkJob:
-    """One resolved APK download task."""
+    """Resolved APK task."""
 
     detail_url: str
     download_url: str
-    package_hint: str | None
-    version_hint: str | None
+    package_name: str | None
+    version: str | None
     year: str | None
     app_name: str | None
 
 
-@dataclass(frozen=True)
-class Options:
-    """Runtime options shared by workers."""
+@dataclass(slots=True, frozen=True)
+class CliArgs:
+    """Typed command options."""
 
+    url: str
     out_dir: Path
-    timeout: int
+    year: str | None
+    latest: bool
+    limit: int | None
+    concurrency: int
+    dry_run: bool
     overwrite: bool
     no_app_rename: bool
-    concurrency: int
+    timeout: int
 
 
-def print_line(message: str) -> None:
-    """Print one flushed log line."""
+def log(message: str) -> None:
+    """Print one line immediately."""
 
     print(message, flush=True)
 
 
-def fetch_text(url: str, timeout: int) -> str:
-    """Fetch a text page."""
+def first_group(match: re.Match[str] | None) -> str | None:
+    """Return the first non-empty regex group."""
 
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Accept": "text/html,application/xhtml+xml",
-        },
-    )
-    with urlopen(request, timeout=timeout) as response:
-        body = response.read()
-        charset = response.headers.get_content_charset() or "utf-8"
-    return body.decode(charset, errors="replace")
+    if match is None:
+        return None
+    for value in match.groups():
+        if value:
+            text = re.sub(r"<.*?>", "", value).strip()
+            return html.unescape(text)
+    return None
 
 
-def normalize_url(url: str, base_url: str) -> str:
-    """Unescape and absolutize a URL."""
+def safe_part(value: str | None, fallback: str) -> str:
+    """Make a string safe for use inside a file name."""
 
-    return html.unescape(urljoin(base_url, url.strip()))
+    text = html.unescape(value or "").strip()
+    text = re.sub(r"[\\/:*?\"<>|\s]+", "_", text)
+    text = re.sub(r"_+", "_", text).strip("._-")
+    return text or fallback
 
 
-def unique_items(items: Iterable[str]) -> list[str]:
-    """Return items in original order with duplicates removed."""
+def clean_version(value: str | None) -> str | None:
+    """Normalize version text."""
+
+    if value is None:
+        return None
+    text = html.unescape(value).strip()
+    text = text.removeprefix("v").removeprefix("V")
+    text = re.sub(r"[^0-9A-Za-z._+-]+", "_", text).strip("._-+")
+    return text or None
+
+
+def unique(items: list[str]) -> list[str]:
+    """Deduplicate a list while keeping order."""
 
     seen: set[str] = set()
     result: list[str] = []
@@ -119,393 +123,347 @@ def unique_items(items: Iterable[str]) -> list[str]:
     return result
 
 
-def first_group(match: re.Match[str] | None) -> str | None:
-    """Return the first non-empty regex capture group."""
+def app_id_from_url(url: str) -> str | None:
+    """Extract Wandoujia app id from URL."""
 
-    if match is None:
-        return None
-    for group in match.groups():
-        if group:
-            return html.unescape(re.sub(r"<.*?>", "", group).strip())
+    match = APP_ID_RE.search(url)
+    if match:
+        return match.group(1)
     return None
 
 
-def safe_name_part(value: str | None, fallback: str) -> str:
-    """Make one filename segment safe."""
+def apply_year(url: str, year: str | None) -> str:
+    """Build the requested year history URL."""
 
-    text = html.unescape(value or "").strip()
-    text = re.sub(r"[\\/:*?\"<>|\s]+", "_", text)
-    text = re.sub(r"_+", "_", text).strip("._-")
-    return text or fallback
-
-
-def clean_version(version: str | None) -> str | None:
-    """Normalize a version name from HTML or app-rename."""
-
-    if version is None:
-        return None
-    text = html.unescape(version).strip()
-    text = text.removeprefix("v").removeprefix("V")
-    text = re.sub(r"[^0-9A-Za-z._+-]+", "_", text).strip("._-+")
-    return text or None
+    if not year:
+        return url
+    app_id = app_id_from_url(url)
+    if app_id is None:
+        raise ValueError("--year needs a Wandoujia /apps/<id> URL")
+    return f"https://www.wandoujia.com/apps/{app_id}/history_y{year}"
 
 
-def extract_detail_urls(page_url: str, page_body: str) -> list[str]:
-    """Extract all history detail page URLs.
+def absolute_url(value: str, base_url: str) -> str:
+    """Decode and absolutize a URL."""
 
-    Wandoujia's "查看更多" button only reveals hidden <li> nodes already in the
-    initial HTML. There is no extra paging request for the observed
-    history page.
+    return html.unescape(urljoin(base_url, value.strip()))
+
+
+def detail_urls(page_url: str, page_body: str) -> list[str]:
+    """Extract all history_v links.
+
+    The tested Wandoujia "查看更多" button only reveals hidden list items that
+    already exist in the first HTML response.
     """
 
-    urls = (
-        normalize_url(match.group(0), page_url)
+    urls = [
+        absolute_url(match.group(0), page_url)
         for match in DETAIL_RE.finditer(page_body)
-    )
-    return unique_items(urls)
+    ]
+    return unique(urls)
 
 
-def extract_package(page_body: str) -> str | None:
-    """Extract package name from page metadata."""
+def package_name(page_body: str) -> str | None:
+    """Extract package name from Wandoujia HTML."""
 
     return first_group(APP_PNAME_RE.search(page_body))
 
 
-def extract_version(page_body: str) -> str | None:
-    """Extract version name from page metadata."""
+def version_name(page_body: str) -> str | None:
+    """Extract version name from Wandoujia HTML."""
 
-    version = first_group(APP_VNAME_RE.search(page_body))
-    if version is None:
-        version = first_group(VERSION_TEXT_RE.search(page_body))
-    return clean_version(version)
+    value = first_group(APP_VNAME_RE.search(page_body))
+    if value is None:
+        value = first_group(VERSION_TEXT_RE.search(page_body))
+    return clean_version(value)
 
 
-def extract_year(page_body: str, page_url: str) -> str | None:
-    """Extract release year from update time or history_y URL."""
+def release_year(page_body: str, page_url: str) -> str | None:
+    """Extract release year from HTML or URL."""
 
-    year = first_group(UPDATE_YEAR_RE.search(page_body))
-    if year is not None:
-        return year
+    value = first_group(UPDATE_YEAR_RE.search(page_body))
+    if value:
+        return value
     match = HISTORY_YEAR_RE.search(page_url)
     if match:
         return match.group(1)
     return None
 
 
-def extract_app_name(page_body: str) -> str | None:
-    """Extract the app display name, mostly for future logs."""
+def app_name(page_body: str) -> str | None:
+    """Extract display name from HTML."""
 
-    title = first_group(TITLE_RE.search(page_body))
-    if title is None:
+    value = first_group(TITLE_RE.search(page_body))
+    if value is None:
         return None
-    title = re.sub(r"[_-].*$", "", title).strip()
-    return title or None
+    value = re.sub(r"[_-].*$", "", value).strip()
+    return value or None
 
 
-def extract_download_url(detail_url: str, page_body: str) -> str:
-    """Extract the APK URL from a Wandoujia detail page."""
+def download_url(detail_url: str, page_body: str) -> str:
+    """Extract the APK URL from a detail page."""
 
     for regex in (DATA_HREF_RE, HREF_APK_RE):
         match = regex.search(page_body)
         if match:
-            return normalize_url(match.group(1), detail_url)
+            return absolute_url(match.group(1), detail_url)
 
     match = re.search(r"downloadUrl=([^\"'&]+)", page_body)
     if match:
         return html.unescape(unquote(match.group(1)))
 
-    raise ValueError(f"no APK download URL found: {detail_url}")
+    raise ValueError(f"APK URL not found: {detail_url}")
 
 
-def build_year_url(input_url: str, year: str | None) -> str:
-    """Build /history_yYYYY URL when --year is provided."""
-
-    if not year:
-        return input_url
-    match = APP_ID_RE.search(input_url)
-    if match is None:
-        raise ValueError("--year requires a Wandoujia /apps/<id> URL")
-    return f"https://www.wandoujia.com/apps/{match.group(1)}/history_y{year}"
-
-
-def resolve_one_job(detail_url: str, timeout: int) -> ApkJob:
-    """Resolve one detail page into one APK job."""
-
-    page_body = fetch_text(detail_url, timeout)
-    return ApkJob(
-        detail_url=detail_url,
-        download_url=extract_download_url(detail_url, page_body),
-        package_hint=extract_package(page_body),
-        version_hint=extract_version(page_body),
-        year=extract_year(page_body, detail_url),
-        app_name=extract_app_name(page_body),
-    )
-
-
-def resolve_jobs(
-    input_url: str,
-    timeout: int,
-    latest: bool,
-    limit: int | None,
-    concurrency: int,
-) -> list[ApkJob]:
-    """Resolve an input URL to APK download jobs."""
-
-    page_body = fetch_text(input_url, timeout)
-    parsed = urlparse(input_url)
-    is_detail = HISTORY_DETAIL_RE.search(parsed.path) is not None
-
-    if is_detail:
-        detail_urls = [input_url]
-    else:
-        detail_urls = extract_detail_urls(input_url, page_body)
-
-    if not detail_urls:
-        try:
-            return [
-                ApkJob(
-                    detail_url=input_url,
-                    download_url=extract_download_url(input_url, page_body),
-                    package_hint=extract_package(page_body),
-                    version_hint=extract_version(page_body),
-                    year=extract_year(page_body, input_url),
-                    app_name=extract_app_name(page_body),
-                )
-            ]
-        except ValueError as error:
-            message = f"no history detail links found: {input_url}"
-            raise ValueError(message) from error
-
-    if latest:
-        detail_urls = detail_urls[:1]
-    if limit is not None:
-        detail_urls = detail_urls[:max(0, limit)]
-
-    if is_detail:
-        return [
-            ApkJob(
-                detail_url=input_url,
-                download_url=extract_download_url(input_url, page_body),
-                package_hint=extract_package(page_body),
-                version_hint=extract_version(page_body),
-                year=extract_year(page_body, input_url),
-                app_name=extract_app_name(page_body),
-            )
-        ]
-
-    max_workers = max(1, concurrency)
-    indexed_jobs: dict[int, ApkJob] = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(resolve_one_job, url, timeout): index
-            for index, url in enumerate(detail_urls)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                indexed_jobs[index] = future.result()
-            except (ValueError, HTTPError, URLError, TimeoutError) as error:
-                detail_url = detail_urls[index]
-                print(
-                    f"[warn] skip detail {detail_url}: {error}",
-                    file=sys.stderr,
-                )
-
-    return [indexed_jobs[index] for index in sorted(indexed_jobs)]
-
-
-def download_file(
-    url: str,
-    destination: Path,
-    timeout: int,
-    progress_prefix: str,
-) -> None:
-    """Download a URL to a local file."""
-
-    request = Request(
-        url,
-        headers={
-            "User-Agent": USER_AGENT,
-            "Referer": "https://www.wandoujia.com/",
-        },
-    )
-    with urlopen(request, timeout=timeout) as response:
-        total = int(response.headers.get("Content-Length") or "0")
-        done = 0
-        with destination.open("wb") as output:
-            while True:
-                chunk = response.read(1024 * 256)
-                if not chunk:
-                    break
-                output.write(chunk)
-                done += len(chunk)
-                if total:
-                    percent = done / total
-                    print(
-                        f"\r{progress_prefix} {percent:6.1%} {done}/{total}",
-                        end="",
-                        file=sys.stderr,
-                    )
-        if total:
-            print(file=sys.stderr)
-
-
-def find_app_rename() -> str | None:
-    """Find app-rename/apprename on PATH."""
-
-    return shutil.which("app-rename") or shutil.which("apprename")
-
-
-def run_app_rename(apk_path: Path) -> tuple[Path, str | None, str | None]:
-    """Run app-rename and infer package/version from its output filename."""
-
-    tool = find_app_rename()
-    if tool is None:
-        return apk_path, None, None
-
-    before = {item.resolve() for item in apk_path.parent.iterdir()}
-    try:
-        subprocess.run(
-            [tool, str(apk_path)],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except (OSError, subprocess.CalledProcessError) as error:
-        print(f"[warn] app-rename failed: {error}", file=sys.stderr)
-        return apk_path, None, None
-
-    candidates = [
-        item
-        for item in apk_path.parent.iterdir()
-        if item.suffix.lower() in {".apk", ".xapk"}
-    ]
-    renamed = next(
-        (
-            item
-            for item in candidates
-            if (
-                item.resolve() not in before
-                or item.resolve() != apk_path.resolve()
-            )
-        ),
-        None,
-    )
-    if renamed is None:
-        renamed = apk_path if apk_path.exists() else candidates[0]
-
-    match = re.match(r"(.+)_([0-9][0-9A-Za-z._+-]*)$", renamed.stem)
-    if match is None:
-        return renamed, None, None
-    package_name = safe_name_part(match.group(1), "unknown.package")
-    version = clean_version(match.group(2))
-    return renamed, package_name, version
-
-
-def final_path(
+def target_path(
     out_dir: Path,
-    package_name: str | None,
-    version: str | None,
-    year: str | None,
-    overwrite: bool,
+    package_value: str | None,
+    version_value: str | None,
+    year_value: str | None,
 ) -> Path:
-    """Build a unique final APK path."""
+    """Build the canonical output path."""
 
-    name = "{}-{}-{}.apk".format(
-        safe_name_part(package_name, "unknown.package"),
-        safe_name_part(version, "unknown_version"),
-        safe_name_part(year, "unknown_year"),
+    file_name = "{}-{}-{}.apk".format(
+        safe_part(package_value, "unknown.package"),
+        safe_part(version_value, "unknown_version"),
+        safe_part(year_value, "unknown_year"),
     )
-    path = out_dir / name
+    return out_dir / file_name
+
+
+def available_path(path: Path, overwrite: bool) -> Path:
+    """Return path or a collision-safe variant."""
+
     if overwrite or not path.exists():
         return path
 
     index = 1
     while True:
-        candidate = out_dir / f"{path.stem}__{index}{path.suffix}"
+        candidate = path.with_name(f"{path.stem}__{index}{path.suffix}")
         if not candidate.exists():
             return candidate
         index += 1
 
 
-def download_job(index: int, job: ApkJob, options: Options) -> Path:
-    """Download and rename one APK."""
+async def fetch_text(session: aiohttp.ClientSession, url: str) -> str:
+    """Fetch text with aiohttp."""
 
-    options.out_dir.mkdir(parents=True, exist_ok=True)
-    prefix = f"[{index}]"
-    print_line(f"{prefix} {job.detail_url}")
-    print_line(f"    download: {job.download_url}")
+    async with session.get(url) as response:
+        response.raise_for_status()
+        return await response.text(errors="replace")
 
+
+async def resolve_detail(
+    session: aiohttp.ClientSession,
+    detail_url: str,
+) -> ApkJob | None:
+    """Resolve one detail URL to an APK job."""
+
+    try:
+        body = await fetch_text(session, detail_url)
+        return ApkJob(
+            detail_url=detail_url,
+            download_url=download_url(detail_url, body),
+            package_name=package_name(body),
+            version=version_name(body),
+            year=release_year(body, detail_url),
+            app_name=app_name(body),
+        )
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
+        print(f"[warn] skip detail {detail_url}: {error}", file=sys.stderr)
+        return None
+
+
+async def resolve_jobs(
+    session: aiohttp.ClientSession,
+    input_url: str,
+    latest: bool,
+    limit: int | None,
+) -> list[ApkJob]:
+    """Resolve an input URL to APK jobs."""
+
+    body = await fetch_text(session, input_url)
+    path = urlparse(input_url).path
+    is_detail = DETAIL_PATH_RE.search(path) is not None
+
+    if is_detail:
+        return [
+            ApkJob(
+                detail_url=input_url,
+                download_url=download_url(input_url, body),
+                package_name=package_name(body),
+                version=version_name(body),
+                year=release_year(body, input_url),
+                app_name=app_name(body),
+            )
+        ]
+
+    urls = detail_urls(input_url, body)
+    if latest:
+        urls = urls[:1]
+    if limit is not None:
+        urls = urls[:max(0, limit)]
+    if not urls:
+        return [
+            ApkJob(
+                detail_url=input_url,
+                download_url=download_url(input_url, body),
+                package_name=package_name(body),
+                version=version_name(body),
+                year=release_year(body, input_url),
+                app_name=app_name(body),
+            )
+        ]
+
+    tasks = [resolve_detail(session, url) for url in urls]
+    jobs = await asyncio.gather(*tasks)
+    return [job for job in jobs if job is not None]
+
+
+async def download_file(
+    session: aiohttp.ClientSession,
+    url: str,
+    path: Path,
+) -> None:
+    """Stream one APK to disk."""
+
+    async with session.get(url) as response:
+        response.raise_for_status()
+        with path.open("wb") as output:
+            async for chunk in response.content.iter_chunked(1024 * 256):
+                output.write(chunk)
+
+
+def rename_tool() -> str | None:
+    """Find app-rename or apprename."""
+
+    return shutil.which("app-rename") or shutil.which("apprename")
+
+
+async def inspect_apk(path: Path) -> tuple[Path, str | None, str | None]:
+    """Run app-rename/apprename and read package/version from file name."""
+
+    tool = rename_tool()
+    if tool is None:
+        return path, None, None
+
+    before = {item.resolve() for item in path.parent.iterdir()}
+    try:
+        process = await asyncio.create_subprocess_exec(
+            tool,
+            str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+    except OSError as error:
+        print(f"[warn] app rename failed: {error}", file=sys.stderr)
+        return path, None, None
+    if process.returncode != 0:
+        message = stderr.decode(errors="replace").strip()
+        print(f"[warn] app rename failed: {message}", file=sys.stderr)
+        return path, None, None
+
+    candidates = [
+        item
+        for item in path.parent.iterdir()
+        if item.suffix.lower() in {".apk", ".xapk"}
+    ]
+    renamed = path if path.exists() else None
+    for item in candidates:
+        if item.resolve() not in before or item.resolve() != path.resolve():
+            renamed = item
+            break
+    if renamed is None:
+        return path, None, None
+
+    match = re.match(r"(.+)_([0-9][0-9A-Za-z._+-]*)$", renamed.stem)
+    if match is None:
+        return renamed, None, None
+    parsed_package = safe_part(match.group(1), "unknown.package")
+    parsed_version = clean_version(match.group(2))
+    return renamed, parsed_package, parsed_version
+
+
+async def save_job(
+    session: aiohttp.ClientSession,
+    index: int,
+    job: ApkJob,
+    args: CliArgs,
+) -> Path | None:
+    """Download one job and move it to the final file name."""
+
+    hinted_path = target_path(
+        args.out_dir,
+        job.package_name,
+        job.version,
+        job.year,
+    )
+    if hinted_path.exists() and not args.overwrite:
+        log(f"[{index}] exists: {hinted_path}")
+        return hinted_path
+
+    log(f"[{index}] download: {job.detail_url}")
+    args.out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="wdj-apk-") as temp_dir:
         temp_path = Path(temp_dir) / "download.apk"
-        progress_prefix = f"{prefix} download"
-        download_file(
-            job.download_url,
-            temp_path,
-            options.timeout,
-            progress_prefix,
-        )
+        try:
+            await download_file(session, job.download_url, temp_path)
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as error:
+            print(f"[warn] skip download #{index}: {error}", file=sys.stderr)
+            return None
 
-        package_name = job.package_hint
-        version = job.version_hint
         source_path = temp_path
-        if not options.no_app_rename:
-            rename_result = run_app_rename(temp_path)
-            source_path, package_from_apk, version_from_apk = rename_result
-            package_name = package_from_apk or package_name
-            version = version_from_apk or version
+        package_value = job.package_name
+        version_value = job.version
+        if not args.no_app_rename:
+            source_path, apk_package, apk_version = await inspect_apk(
+                temp_path,
+            )
+            package_value = apk_package or package_value
+            version_value = apk_version or version_value
 
-        destination = final_path(
-            options.out_dir,
-            package_name,
-            version,
+        final_path = target_path(
+            args.out_dir,
+            package_value,
+            version_value,
             job.year,
-            options.overwrite,
         )
-        if destination.exists() and options.overwrite:
-            destination.unlink()
-        shutil.move(str(source_path), destination)
-        print_line(f"    saved: {destination}")
-        return destination
+        final_path = available_path(final_path, args.overwrite)
+        if final_path.exists() and args.overwrite:
+            final_path.unlink()
+        shutil.move(str(source_path), final_path)
+        log(f"[{index}] saved: {final_path}")
+        return final_path
 
 
-def download_jobs(jobs: list[ApkJob], options: Options) -> list[Path]:
-    """Download jobs concurrently and return paths in job order."""
+async def save_jobs(
+    session: aiohttp.ClientSession,
+    jobs: list[ApkJob],
+    args: CliArgs,
+) -> list[Path]:
+    """Download all jobs. aiohttp connector limit controls concurrency."""
 
-    indexed_paths: dict[int, Path] = {}
-    max_workers = max(1, options.concurrency)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(download_job, index, job, options): index
-            for index, job in enumerate(jobs, 1)
-        }
-        for future in as_completed(futures):
-            index = futures[future]
-            try:
-                indexed_paths[index] = future.result()
-            except (HTTPError, URLError, TimeoutError, OSError) as error:
-                print(
-                    f"[warn] skip download #{index}: {error}",
-                    file=sys.stderr,
-                )
-    return [indexed_paths[index] for index in sorted(indexed_paths)]
+    tasks = [
+        save_job(session, index, job, args)
+        for index, job in enumerate(jobs, 1)
+    ]
+    results = await asyncio.gather(*tasks)
+    return [path for path in results if path is not None]
 
 
-def print_dry_run(jobs: list[ApkJob]) -> None:
-    """Print resolved jobs without downloading files."""
+def print_jobs(jobs: list[ApkJob]) -> None:
+    """Print dry-run result."""
 
     for index, job in enumerate(jobs, 1):
-        package_name = job.package_hint or "<app-rename>"
-        version = job.version_hint or "<app-rename>"
-        year = job.year or "unknown_year"
-        print_line(f"[{index}] detail:   {job.detail_url}")
-        print_line(f"    download: {job.download_url}")
-        print_line(f"    name:     {package_name}-{version}-{year}.apk")
+        path = target_path(Path("."), job.package_name, job.version, job.year)
+        log(f"[{index}] detail:   {job.detail_url}")
+        log(f"    download: {job.download_url}")
+        log(f"    name:     {path.name}")
 
 
-def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    """Parse command line arguments."""
+def parse_args(argv: list[str] | None) -> CliArgs:
+    """Parse CLI args."""
 
     parser = argparse.ArgumentParser(
         description="Download Wandoujia APKs as package-version-year.apk",
@@ -520,81 +478,94 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=".",
         help="output directory, default: current directory",
     )
-    parser.add_argument(
-        "--year",
-        help="force a year page, e.g. --year 2026",
-    )
+    parser.add_argument("--year", help="force a year page, e.g. --year 2026")
     parser.add_argument(
         "--latest",
         action="store_true",
-        help="only download the first/latest version found",
+        help="only process the first/latest version found",
     )
     parser.add_argument(
         "--limit",
         type=int,
-        help="maximum number of versions to process",
+        help="maximum versions to process",
     )
     parser.add_argument(
         "-c",
         "--concurrency",
         type=int,
-        default=4,
-        help="concurrent detail/download workers, default: 4",
+        default=8,
+        help="aiohttp connector concurrency, default: 8",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print resolved URLs and target names without downloading",
+        help="print URLs and target names without downloading",
     )
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="overwrite an existing output file",
+        help="overwrite existing output files",
     )
     parser.add_argument(
         "--no-app-rename",
         action="store_true",
-        help="skip app-rename/apprename and use HTML metadata only",
+        help="skip app-rename/apprename and use HTML metadata",
     )
     parser.add_argument(
         "--timeout",
         type=int,
         default=30,
-        help="HTTP timeout in seconds, default: 30",
+        help="HTTP timeout seconds, default: 30",
     )
-    return parser.parse_args(argv)
+    raw = parser.parse_args(argv)
+    return CliArgs(
+        url=raw.url,
+        out_dir=Path(raw.out_dir),
+        year=raw.year,
+        latest=raw.latest,
+        limit=raw.limit,
+        concurrency=raw.concurrency,
+        dry_run=raw.dry_run,
+        overwrite=raw.overwrite,
+        no_app_rename=raw.no_app_rename,
+        timeout=raw.timeout,
+    )
+
+
+async def run(args: CliArgs) -> int:
+    """Run the downloader."""
+
+    timeout = aiohttp.ClientTimeout(total=args.timeout)
+    connector = aiohttp.TCPConnector(limit=max(1, args.concurrency))
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://www.wandoujia.com/",
+    }
+    async with aiohttp.ClientSession(
+        connector=connector,
+        timeout=timeout,
+        headers=headers,
+    ) as session:
+        input_url = apply_year(args.url, args.year)
+        jobs = await resolve_jobs(session, input_url, args.latest, args.limit)
+        if args.dry_run:
+            print_jobs(jobs)
+            return 0
+
+        saved_paths = await save_jobs(session, jobs, args)
+        log("\nDone:")
+        for path in saved_paths:
+            log(str(path))
+        return 0
 
 
 def main(argv: list[str] | None = None) -> int:
-    """CLI entry point."""
+    """CLI entrypoint."""
 
     args = parse_args(argv)
     try:
-        input_url = build_year_url(args.url, args.year)
-        jobs = resolve_jobs(
-            input_url=input_url,
-            timeout=args.timeout,
-            latest=args.latest,
-            limit=args.limit,
-            concurrency=args.concurrency,
-        )
-        if args.dry_run:
-            print_dry_run(jobs)
-            return 0
-
-        options = Options(
-            out_dir=Path(args.out_dir),
-            timeout=args.timeout,
-            overwrite=args.overwrite,
-            no_app_rename=args.no_app_rename,
-            concurrency=args.concurrency,
-        )
-        saved_paths = download_jobs(jobs, options)
-        print_line("\nDone:")
-        for path in saved_paths:
-            print_line(str(path))
-        return 0
-    except (ValueError, HTTPError, URLError, TimeoutError) as error:
+        return asyncio.run(run(args))
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 

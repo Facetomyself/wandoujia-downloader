@@ -13,9 +13,9 @@
 com.smile.gifmaker-14.6.20.49153-2026.apk
 ```
 
-脚本本身只使用 Python 标准库。若本机 `PATH` 里存在 `app-rename` 或
-`apprename`，会优先用它读取 APK 内部包名和版本号；否则使用豌豆荚页面中的
-`data-app-pname` / `data-app-vname` 元数据。
+脚本使用 `aiohttp` 做异步请求和并发下载。若本机 `PATH` 里存在
+`app-rename` 或 `apprename`，会优先用它读取 APK 内部包名和版本号；
+否则使用豌豆荚页面中的 `data-app-pname` / `data-app-vname` 元数据。
 
 `apprename` / `app-rename` 是作者主页里的 APK/XAPK 重命名工具，主页：
 
@@ -27,6 +27,7 @@ https://github.com/LunFengChen
 
 ```bash
 python3 --version
+python3 -m pip install aiohttp
 ```
 
 可选检查：
@@ -67,7 +68,7 @@ python3 wandoujia_downloader.py \
 | `--year YEAR` | 从任意 `/apps/<id>` 链接强制构造某年份页面。 | `--year 2026` |
 | `--latest` | 只处理解析到的第一个版本，通常是最新历史版本。 | `--latest` |
 | `--limit N` | 限制最多处理多少个历史版本。 | `--limit 10` |
-| `-c, --concurrency N` | 并发解析和下载数量，默认 `4`。 | `-c 8` |
+| `-c, --concurrency N` | aiohttp 连接池并发数量，默认 `8`。 | `-c 8` |
 | `--dry-run` | 只打印详情页、下载链接和目标文件名，不下载 APK。 | `--dry-run` |
 | `--overwrite` | 目标文件已存在时直接覆盖；默认会生成 `__1` 后缀避免覆盖。 | `--overwrite` |
 | `--no-app-rename` | 跳过 `app-rename` / `apprename`，只使用页面元数据命名。 | `--no-app-rename` |
