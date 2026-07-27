@@ -1,41 +1,45 @@
 # wandoujia-downloader
 
-Download APK files from Wandoujia app history pages and rename them as:
+豌豆荚历史版本 APK 下载器。输入豌豆荚 App 链接，自动解析历史版本详情页和
+“普通下载”链接，并把 APK 保存为规范文件名：
 
 ```text
-package-version-year.apk
+包名-版本号-年号.apk
 ```
 
-For example:
+示例：
 
 ```text
 com.smile.gifmaker-14.6.20.49153-2026.apk
 ```
 
-The script uses only Python standard-library modules. If `app-rename` or
-`apprename` exists on `PATH`, the downloaded APK is inspected with that tool to
-confirm the package name and version. If the tool is absent, Wandoujia page
-metadata is used.
+脚本本身只使用 Python 标准库。若本机 `PATH` 里存在 `app-rename` 或
+`apprename`，会优先用它读取 APK 内部包名和版本号；否则使用豌豆荚页面中的
+`data-app-pname` / `data-app-vname` 元数据。
 
-## Install
+`apprename` / `app-rename` 是作者主页里的 APK/XAPK 重命名工具，主页：
 
-No Python dependencies are required.
+```text
+https://github.com/LunFengChen
+```
+
+## 环境
 
 ```bash
 python3 --version
 ```
 
-Optional package-name verifier:
+可选检查：
 
 ```bash
 app-rename --help
-# or
+# 或
 apprename --help
 ```
 
-## Usage
+## CLI 使用教程
 
-Preview parsed APK URLs without downloading:
+### 1. 预览解析结果，不下载
 
 ```bash
 python3 wandoujia_downloader.py \
@@ -45,7 +49,7 @@ python3 wandoujia_downloader.py \
   -c 8
 ```
 
-Download every downloadable APK from the full history page:
+### 2. 下载全部可解析历史 APK
 
 ```bash
 python3 wandoujia_downloader.py \
@@ -54,60 +58,23 @@ python3 wandoujia_downloader.py \
   -c 8
 ```
 
-Download one year:
+## 单个选项说明
 
-```bash
-python3 wandoujia_downloader.py \
-  'https://www.wandoujia.com/apps/280621/history_y2026' \
-  -o ./apks \
-  -c 8
-```
+| 选项 | 作用 | 示例 |
+| --- | --- | --- |
+| `url` | 必填。豌豆荚 `/history`、`/history_yYYYY` 或 `/history_vNNNNN` 链接。 | `https://www.wandoujia.com/apps/280621/history` |
+| `-o, --out-dir DIR` | 指定 APK 输出目录，默认当前目录。 | `-o ./apks` |
+| `--year YEAR` | 从任意 `/apps/<id>` 链接强制构造某年份页面。 | `--year 2026` |
+| `--latest` | 只处理解析到的第一个版本，通常是最新历史版本。 | `--latest` |
+| `--limit N` | 限制最多处理多少个历史版本。 | `--limit 10` |
+| `-c, --concurrency N` | 并发解析和下载数量，默认 `4`。 | `-c 8` |
+| `--dry-run` | 只打印详情页、下载链接和目标文件名，不下载 APK。 | `--dry-run` |
+| `--overwrite` | 目标文件已存在时直接覆盖；默认会生成 `__1` 后缀避免覆盖。 | `--overwrite` |
+| `--no-app-rename` | 跳过 `app-rename` / `apprename`，只使用页面元数据命名。 | `--no-app-rename` |
+| `--timeout SECONDS` | HTTP 请求超时时间，默认 `30` 秒。 | `--timeout 60` |
 
-Use a normal history URL and force a year page:
+## 关于“查看更多”
 
-```bash
-python3 wandoujia_downloader.py \
-  'https://www.wandoujia.com/apps/280621/history' \
-  --year 2026 \
-  -o ./apks \
-  -c 8
-```
-
-Download only the latest entry:
-
-```bash
-python3 wandoujia_downloader.py \
-  'https://www.wandoujia.com/apps/280621/history' \
-  --latest \
-  -o ./apks
-```
-
-Download one detail page:
-
-```bash
-python3 wandoujia_downloader.py \
-  'https://www.wandoujia.com/apps/280621/history_v49153' \
-  -o ./apks
-```
-
-## Options
-
-```text
--o, --out-dir DIR       Output directory. Default: current directory.
---year YEAR             Force /history_yYEAR from any /apps/<id> URL.
---latest                Process only the first/latest entry.
---limit N               Process at most N versions.
--c, --concurrency N     Concurrent workers. Default: 4.
---dry-run               Print resolved URLs and target names, then exit.
---overwrite             Replace an existing output file.
---no-app-rename         Use Wandoujia HTML metadata only.
---timeout SECONDS       HTTP timeout. Default: 30.
-```
-
-## About the `查看更多` button
-
-On the tested Wandoujia `/history` pages, the `查看更多` button does not request
-another API page. Hidden versions are already present in the initial HTML as
-`history-list-more` items. This downloader parses all `history_v...` links from
-the HTML directly, so it can collect all visible and hidden history entries
-without browser automation.
+豌豆荚 `/history` 页面里的“查看更多”按钮并不是新的分页接口。隐藏历史版本
+已经在初始 HTML 里，只是后续 `<li>` 带有 `history-list-more` 类名。脚本会
+直接解析页面中的全部 `history_v...` 链接，所以无需浏览器自动化点击。
