@@ -44,6 +44,12 @@ class CliContractTests(unittest.TestCase):
         self.assertEqual(args.retries, 2)
         self.assertEqual(args.max_bytes, 4 * 1024 * 1024 * 1024)
 
+    def test_multiple_history_selectors_are_rejected(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_parser().parse_args(
+                ["download", "596157", "--latest", "--version-code", "3120"]
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

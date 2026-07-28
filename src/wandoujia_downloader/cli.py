@@ -77,21 +77,22 @@ def _add_selection_options(parser: argparse.ArgumentParser) -> None:
         help="choose a one-based search result when the target is ambiguous",
     )
     parser.add_argument("--year", help="use one history year page, e.g. 2025")
-    parser.add_argument(
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument(
         "--latest",
         action="store_true",
         help="only resolve the first historical version",
     )
-    parser.add_argument(
+    selector.add_argument(
         "--limit",
         type=positive_int,
         help="maximum number of historical detail pages to resolve",
     )
-    parser.add_argument(
+    selector.add_argument(
         "--version",
         help="keep jobs whose displayed version name matches exactly",
     )
-    parser.add_argument(
+    selector.add_argument(
         "--version-code",
         help="resolve one direct Wandoujia history_v version code",
     )

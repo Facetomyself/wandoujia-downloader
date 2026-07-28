@@ -476,6 +476,8 @@ class WandoujiaClient:
                     source_download_url_sha256=url_hash,
                     expected_size=job.expected_size,
                     expected_md5=job.expected_md5,
+                    expected_crc32=job.expected_crc32,
+                    min_sdk=job.min_sdk,
                 )
 
             size, sha256, md5 = await self._stream_apk(
@@ -505,6 +507,8 @@ class WandoujiaClient:
                 source_download_url_sha256=url_hash,
                 expected_size=job.expected_size,
                 expected_md5=job.expected_md5,
+                expected_crc32=job.expected_crc32,
+                min_sdk=job.min_sdk,
             )
         except (OSError, InputError, DownloadError) as error:
             _unlink_best_effort(part_path)
@@ -523,6 +527,8 @@ class WandoujiaClient:
                 source_download_url_sha256=url_hash,
                 expected_size=job.expected_size,
                 expected_md5=job.expected_md5,
+                expected_crc32=job.expected_crc32,
+                min_sdk=job.min_sdk,
                 error=str(error),
             )
 

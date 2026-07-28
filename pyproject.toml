@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "wandoujia-downloader"
-version = "0.2.0"
+version = "0.2.1"
 description = "Search, list, download, and verify historical APKs from Wandoujia"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -20,3 +20,7 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.urls]
+Repository = "https://github.com/Facetomyself/wandoujia-downloader"
+Upstream = "https://github.com/LunFengChen/wandoujia-downloader"

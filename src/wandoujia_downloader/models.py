@@ -63,4 +63,6 @@ class ApkArtifact:
     source_download_url_sha256: str
     expected_size: int | None
     expected_md5: str | None
+    expected_crc32: str | None = None
+    min_sdk: str | None = None
     error: str | None = None

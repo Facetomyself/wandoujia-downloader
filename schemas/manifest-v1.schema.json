@@ -43,11 +43,16 @@
           "sha256",
           "md5",
           "archive_valid",
+          "package_name",
+          "version",
+          "version_code",
           "source_detail_url",
           "source_download_url",
           "source_download_url_sha256",
           "expected_size",
           "expected_md5",
+          "expected_crc32",
+          "min_sdk",
           "error"
         ],
         "properties": {
@@ -65,6 +70,8 @@
           "source_download_url_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
           "expected_size": { "type": ["integer", "null"], "minimum": 0 },
           "expected_md5": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}$" },
+          "expected_crc32": { "type": ["string", "null"] },
+          "min_sdk": { "type": ["string", "null"] },
           "error": { "type": ["string", "null"] }
         }
       }
